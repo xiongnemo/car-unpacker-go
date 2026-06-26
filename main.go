@@ -8,6 +8,7 @@ import (
 	"image/color"
 	"image/png"
 	"io"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -278,6 +279,10 @@ func processRendition(csiData []byte, outDir string, idx int) error {
 		return extractRAWDData(csiData, bitmapStart, outDir, idx, name, csi)
 	}
 
+	if bmpTag == "RLOC" || bmpTag == "COLR" {
+		return extractColorRendition(csiData, bitmapStart, outDir, idx, name, csi)
+	}
+
 	// Try to find dmp2 magic directly
 	dm2Start := bytes.Index(csiData[bitmapStart:], []byte("dmp2"))
 	if dm2Start >= 0 {
@@ -327,6 +332,56 @@ func extractRAWDData(csiData []byte, offset int, outDir string, idx int, name st
 		return err
 	}
 	fmt.Printf("    RAWD: %d bytes -> %s\n", len(rawData), outPath)
+	return nil
+}
+
+func extractColorRendition(csiData []byte, offset int, outDir string, idx int, name string, csi *CSIHeader) error {
+	if offset+16 > len(csiData) {
+		return fmt.Errorf("COLR header too small")
+	}
+
+	// RLOC/COLR: tag(4), flags(4), color_type(4), num_components(4), f64[num_components]
+	flags := binary.LittleEndian.Uint32(csiData[offset+4 : offset+8])
+	colorType := binary.LittleEndian.Uint32(csiData[offset+8 : offset+12])
+	numComp := binary.LittleEndian.Uint32(csiData[offset+12 : offset+16])
+
+	if numComp > 10 {
+		return fmt.Errorf("too many color components: %d", numComp)
+	}
+
+	compEnd := 16 + int(numComp)*8
+	if offset+compEnd > len(csiData) {
+		return fmt.Errorf("COLR data too short for %d components", numComp)
+	}
+
+	comps := make([]float64, numComp)
+	for i := uint32(0); i < numComp; i++ {
+		comps[i] = math.Float64frombits(binary.LittleEndian.Uint64(csiData[offset+16+int(i)*8 : offset+24+int(i)*8]))
+	}
+
+	_ = flags
+	_ = colorType
+
+	// Output as JSON
+	outPath := filepath.Join(outDir, fmt.Sprintf("%03d_%s.json", idx, sanitizeFilename(name)))
+	rgba := make([]uint8, 4)
+	for i := 0; i < int(numComp) && i < 4; i++ {
+		rgba[i] = uint8(comps[i]*255 + 0.5)
+	}
+
+	jsonData := fmt.Sprintf(`{"name":"%s","components":[`, name)
+	for i, c := range comps {
+		if i > 0 {
+			jsonData += ","
+		}
+		jsonData += fmt.Sprintf("%g", c)
+	}
+	jsonData += fmt.Sprintf(`],"rgba":[%d,%d,%d,%d]}`, rgba[0], rgba[1], rgba[2], rgba[3])
+
+	if err := os.WriteFile(outPath, []byte(jsonData), 0644); err != nil {
+		return err
+	}
+	fmt.Printf("    Color: %s -> %s\n", jsonData, outPath)
 	return nil
 }
 
