@@ -274,6 +274,10 @@ func processRendition(csiData []byte, outDir string, idx int) error {
 		return extractMLECImage(csiData, bitmapStart, outDir, idx, name, csi)
 	}
 
+	if bmpTag == "RAWD" || bmpTag == "DWAR" {
+		return extractRAWDData(csiData, bitmapStart, outDir, idx, name, csi)
+	}
+
 	// Try to find dmp2 magic directly
 	dm2Start := bytes.Index(csiData[bitmapStart:], []byte("dmp2"))
 	if dm2Start >= 0 {
@@ -282,6 +286,47 @@ func processRendition(csiData []byte, outDir string, idx int) error {
 	}
 
 	fmt.Printf("    (no recognized image format)\n")
+	return nil
+}
+
+func extractRAWDData(csiData []byte, offset int, outDir string, idx int, name string, csi *CSIHeader) error {
+	if offset+12 > len(csiData) {
+		return fmt.Errorf("RAWD header too small")
+	}
+
+	flags := binary.LittleEndian.Uint32(csiData[offset+4 : offset+8])
+	dataLen := binary.LittleEndian.Uint32(csiData[offset+8 : offset+12])
+	rawData := csiData[offset+12 : offset+12+int(dataLen)]
+
+	// If flags indicate compression, decompress
+	if flags != 0 {
+		lzfseBin := findLZFSEBinary()
+		if lzfseBin != "" {
+			if dec, err := decompressLZFSE(lzfseBin, rawData); err == nil {
+				rawData = dec
+			}
+		}
+	}
+
+	// Determine file extension from content
+	ext := ".bin"
+	if len(rawData) >= 2 {
+		if rawData[0] == 0xFF && rawData[1] == 0xD8 {
+			ext = ".jpg"
+		} else if len(rawData) >= 4 && string(rawData[:4]) == "\x89PNG" {
+			ext = ".png"
+		} else if len(rawData) >= 4 && string(rawData[:4]) == "%PDF" {
+			ext = ".pdf"
+		} else if len(rawData) >= 12 && string(rawData[4:8]) == "ftyp" {
+			ext = ".heif"
+		}
+	}
+
+	outPath := filepath.Join(outDir, fmt.Sprintf("%03d_%s%s", idx, sanitizeFilename(name), ext))
+	if err := os.WriteFile(outPath, rawData, 0644); err != nil {
+		return err
+	}
+	fmt.Printf("    RAWD: %d bytes -> %s\n", len(rawData), outPath)
 	return nil
 }
 
