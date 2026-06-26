@@ -286,19 +286,84 @@ func processRendition(csiData []byte, outDir string, idx int) error {
 }
 
 func extractMLECImage(csiData []byte, offset int, outDir string, idx int, name string, csi *CSIHeader) error {
-	// MLEC header: tag(4), version(4), field1(4), compressedSize(4), field2(4), field3(4), decompressedSize(4), padding(4)
-	if offset+32 > len(csiData) {
+	if offset+16 > len(csiData) {
 		return fmt.Errorf("MLEC header too small")
 	}
 
-	// Find dmp2 magic after the MLEC header
-	dm2Start := bytes.Index(csiData[offset:], []byte("dmp2"))
-	if dm2Start < 0 {
-		return fmt.Errorf("no dmp2 magic found in MLEC block")
-	}
-	dm2Start += offset
+	// MLEC header: tag(4), flags(4), compressionType(4), rawDataLength(4)
+	flags := binary.LittleEndian.Uint32(csiData[offset+4 : offset+8])
+	compType := binary.LittleEndian.Uint32(csiData[offset+8 : offset+12])
+	rawLen := binary.LittleEndian.Uint32(csiData[offset+12 : offset+16])
+	_ = flags
 
-	return extractDm2Image(csiData, dm2Start, outDir, idx, name)
+	lzfseBin := findLZFSEBinary()
+	if lzfseBin == "" {
+		return fmt.Errorf("lzfse binary not found; build _tools/lzfse first")
+	}
+
+	rawData := csiData[offset+16 : offset+16+int(rawLen)]
+
+	switch compType {
+	case 8: // palette-img
+		return extractPaletteImage(rawData, lzfseBin, outDir, idx, name, csi)
+	case 11: // deepmap2
+		dm2Start := bytes.Index(rawData, []byte("dmp2"))
+		if dm2Start < 0 {
+			return fmt.Errorf("no dmp2 magic in MLEC block")
+		}
+		return extractDm2Image(rawData, dm2Start, outDir, idx, name)
+	default:
+		// Try to find dmp2 magic as fallback
+		dm2Start := bytes.Index(rawData, []byte("dmp2"))
+		if dm2Start >= 0 {
+			return extractDm2Image(rawData, dm2Start, outDir, idx, name)
+		}
+		fmt.Printf("    (unsupported MLEC compression type %d)\n", compType)
+		return nil
+	}
+}
+
+func extractPaletteImage(compressed []byte, lzfseBin string, outDir string, idx int, name string, csi *CSIHeader) error {
+	decompressed, err := decompressLZFSE(lzfseBin, compressed)
+	if err != nil {
+		return fmt.Errorf("palette lzfse decompress: %w", err)
+	}
+
+	// Palette-img decompressed format:
+	// u32 LE magic (0xCAFEF00D), u32 LE version (1), u16 LE palette_count,
+	// palette_count * 4 bytes BGRA entries, width*height index bytes
+	if len(decompressed) < 10 {
+		return fmt.Errorf("palette data too small: %d", len(decompressed))
+	}
+
+	palMagic := binary.LittleEndian.Uint32(decompressed[0:4])
+	palVersion := binary.LittleEndian.Uint32(decompressed[4:8])
+	palCount := binary.LittleEndian.Uint16(decompressed[8:10])
+	_ = palMagic
+	_ = palVersion
+
+	w := int(csi.Width)
+	h := int(csi.Height)
+	expected := 10 + int(palCount)*4 + w*h
+	if len(decompressed) < expected {
+		return fmt.Errorf("palette data too short: need %d, got %d", expected, len(decompressed))
+	}
+
+	fmt.Printf("    palette-img: magic=0x%08X ver=%d count=%d %dx%d\n", palMagic, palVersion, palCount, w, h)
+
+	// Build RGBA image from palette + indices
+	rgba := make([]byte, w*h*4)
+	for i := 0; i < w*h; i++ {
+		idx := decompressed[10+int(palCount)*4+i]
+		bgra := binary.LittleEndian.Uint32(decompressed[10+int(idx)*4 : 14+int(idx)*4])
+		rgba[i*4+0] = byte(bgra >> 16) // R
+		rgba[i*4+1] = byte(bgra >> 8)  // G
+		rgba[i*4+2] = byte(bgra)       // B
+		rgba[i*4+3] = byte(bgra >> 24) // A
+	}
+
+	outPath := filepath.Join(outDir, fmt.Sprintf("%03d_%s.png", idx, sanitizeFilename(name)))
+	return writePNG(outPath, w, h, rgba)
 }
 
 func extractDm2Image(csiData []byte, dm2Offset int, outDir string, idx int, name string) error {
@@ -448,15 +513,21 @@ func extractBandedStreams(csiData []byte, dm2Offset int, payload []byte, firstHe
 }
 
 func findLZFSEBinary() string {
-	candidates := []string{
-		"_tools/lzfse/lzfse.exe",
-		"_tools/lzfse/lzfse",
-		"_tools/lzfse/build/lzfse",
-		"_tools/lzfse/build/lzfse.exe",
+	// Try absolute path next to executable first
+	if exe, err := os.Executable(); err == nil {
+		dir := filepath.Dir(exe)
+		for _, name := range []string{"lzfse.exe", "lzfse"} {
+			p := filepath.Join(dir, name)
+			if _, err := os.Stat(p); err == nil {
+				return p
+			}
+		}
 	}
-	for _, c := range candidates {
-		if _, err := os.Stat(c); err == nil {
-			return c
+	// Try working directory
+	for _, name := range []string{"lzfse.exe", "lzfse"} {
+		if _, err := os.Stat(name); err == nil {
+			abs, _ := filepath.Abs(name)
+			return abs
 		}
 	}
 	// Try PATH
