@@ -1,0 +1,556 @@
+package main
+
+import (
+	"bytes"
+	"encoding/binary"
+	"fmt"
+	"image"
+	"image/color"
+	"image/png"
+	"io"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+)
+
+func main() {
+	if len(os.Args) < 2 {
+		fmt.Fprintf(os.Stderr, "Usage: %s <Assets.car> [output_dir]\n", os.Args[0])
+		os.Exit(1)
+	}
+
+	carPath := os.Args[1]
+	outDir := "car_output"
+	if len(os.Args) >= 3 {
+		outDir = os.Args[2]
+	}
+
+	data, err := os.ReadFile(carPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error reading file: %v\n", err)
+		os.Exit(1)
+	}
+
+	bom, err := ParseBOM(data)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error parsing BOM: %v\n", err)
+		os.Exit(1)
+	}
+
+	fmt.Printf("BOMStore: version=%d, blocks=%d\n", bom.Header.Version, bom.Header.NumberOfBlocks)
+
+	// List variables
+	fmt.Println("\nNamed blocks:")
+	for _, v := range bom.Vars {
+		ptr := bom.Pointers[v.Index]
+		fmt.Printf("  %-20s -> block[%d] addr=0x%X len=%d\n", v.Name, v.Index, ptr.Address, ptr.Length)
+	}
+
+	// Parse CARHEADER
+	if idx, data := bom.NamedBlock("CARHEADER"); data != nil {
+		fmt.Printf("\nCARHEADER (block[%d], %d bytes):\n", idx, len(data))
+		parseCARHeader(data)
+	}
+
+	// Parse EXTENDED_METADATA
+	if idx, data := bom.NamedBlock("EXTENDED_METADATA"); data != nil {
+		fmt.Printf("\nEXTENDED_METADATA (block[%d], %d bytes):\n", idx, len(data))
+		parseExtendedMetadata(data)
+	}
+
+	// Parse KEYFORMAT
+	if idx, data := bom.NamedBlock("KEYFORMAT"); data != nil {
+		fmt.Printf("\nKEYFORMAT (block[%d], %d bytes):\n", idx, len(data))
+		parseKeyFormat(data)
+	}
+
+	// Parse FACETKEYS tree
+	if idx, data := bom.NamedBlock("FACETKEYS"); data != nil {
+		fmt.Printf("\nFACETKEYS tree (block[%d]):\n", idx)
+		parseFacetKeys(bom, data)
+	}
+
+	// Parse RENDITIONS tree and extract images
+	if idx, data := bom.NamedBlock("RENDITIONS"); data != nil {
+		fmt.Printf("\nRENDITIONS tree (block[%d]):\n", idx)
+		err := extractRenditions(bom, data, outDir)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error extracting renditions: %v\n", err)
+		}
+	}
+}
+
+func parseCARHeader(data []byte) {
+	// Tag(4), CoreUIVersion(4), StorageVersion(4), StorageTimestamp(4), RenditionCount(4)
+	// MainVersionString(128), VersionString(256), UUID(16), AssociatedChecksum(4)
+	// SchemaVersion(4), ColorSpaceID(4), KeySemantics(4)
+	if len(data) < 436 {
+		fmt.Printf("  (too small: %d bytes)\n", len(data))
+		return
+	}
+	tag := string(data[0:4])
+	if tag == "RATC" {
+		// Big-endian, need swap
+		fmt.Printf("  Tag: RATC (big-endian)\n")
+	} else if tag == "CTAR" {
+		fmt.Printf("  Tag: CTSR (little-endian)\n")
+	}
+
+	coreuiVer := binary.LittleEndian.Uint32(data[4:8])
+	storageVer := binary.LittleEndian.Uint32(data[8:12])
+	timestamp := binary.LittleEndian.Uint32(data[12:16])
+	rendCount := binary.LittleEndian.Uint32(data[16:20])
+	mainVer := cString(data[20:148])
+	verStr := cString(data[148:404])
+	schemaVer := binary.LittleEndian.Uint32(data[420:424])
+
+	fmt.Printf("  CoreUIVersion: %d\n", coreuiVer)
+	fmt.Printf("  StorageVersion: %d\n", storageVer)
+	fmt.Printf("  Timestamp: %d\n", timestamp)
+	fmt.Printf("  RenditionCount: %d\n", rendCount)
+	fmt.Printf("  MainVersion: %s\n", mainVer)
+	fmt.Printf("  VersionString: %s\n", verStr)
+	fmt.Printf("  SchemaVersion: %d\n", schemaVer)
+}
+
+func parseExtendedMetadata(data []byte) {
+	if len(data) < 1028 {
+		fmt.Printf("  (too small: %d bytes)\n", len(data))
+		return
+	}
+	tag := string(data[0:4])
+	thinning := cString(data[4:260])
+	platformVer := cString(data[260:516])
+	platform := cString(data[516:772])
+	authoring := cString(data[772:1028])
+	fmt.Printf("  Tag: %s\n", tag)
+	fmt.Printf("  Thinning: %s\n", thinning)
+	fmt.Printf("  Platform: %s %s\n", platform, platformVer)
+	fmt.Printf("  AuthoringTool: %s\n", authoring)
+}
+
+func parseKeyFormat(data []byte) {
+	if len(data) < 12 {
+		fmt.Printf("  (too small)\n")
+		return
+	}
+	tag := string(data[0:4])
+	version := binary.LittleEndian.Uint32(data[4:8])
+	maxTokens := binary.LittleEndian.Uint32(data[8:12])
+	fmt.Printf("  Tag: %s, Version: %d, MaxTokens: %d\n", tag, version, maxTokens)
+
+	attrNames := map[uint32]string{
+		0: "Look", 1: "Element", 2: "Part", 3: "Size", 4: "Direction",
+		5: "Value", 6: "Appearance", 7: "Dimension1", 8: "Dimension2",
+		9: "State", 10: "Layer", 11: "Scale", 12: "PresentationState",
+		13: "Idiom", 14: "Subtype", 15: "Identifier", 16: "PreviousValue",
+		17: "PreviousState", 18: "SizeClassH", 19: "SizeClassV",
+		20: "MemoryClass", 21: "GraphicsClass", 22: "DisplayGamut",
+		23: "DeploymentTarget", 24: "Localization", 25: "GlyphWeight",
+		26: "GlyphSize",
+	}
+	for i := uint32(0); i < maxTokens && 12+i*4+4 <= uint32(len(data)); i++ {
+		token := binary.LittleEndian.Uint32(data[12+i*4 : 16+i*4])
+		name := attrNames[token]
+		if name == "" {
+			name = fmt.Sprintf("Unknown(%d)", token)
+		}
+		fmt.Printf("  Token[%d]: %s (%d)\n", i, name, token)
+	}
+}
+
+func parseFacetKeys(bom *BOM, treeData []byte) {
+	th, err := ParseTree(treeData)
+	if err != nil {
+		fmt.Printf("  Error: %v\n", err)
+		return
+	}
+	fmt.Printf("  PathCount: %d, Child: block[%d]\n", th.PathCount, th.Child)
+
+	// Traverse leaf nodes
+	nodeData := bom.Block(th.Child)
+	if nodeData == nil {
+		fmt.Println("  (no root node)")
+		return
+	}
+	for nodeData != nil {
+		node, entries, err := ParseTreeNode(nodeData)
+		if err != nil {
+			fmt.Printf("  Error parsing node: %v\n", err)
+			return
+		}
+		for _, entry := range entries {
+			keyData := bom.Block(entry.KeyIndex)
+			valData := bom.Block(entry.ValueIndex)
+			name := cString(keyData)
+			fmt.Printf("  '%s'", name)
+			if valData != nil && len(valData) >= 4 {
+				// Parse renditionkeytoken: cursorHotSpot(4), numAttrs(2), attrs[]
+				numAttrs := binary.LittleEndian.Uint16(valData[4:6])
+				fmt.Printf(" (attrs: %d)", numAttrs)
+			}
+			fmt.Println()
+		}
+		if node.Forward == 0 {
+			break
+		}
+		nodeData = bom.Block(node.Forward)
+	}
+}
+
+func extractRenditions(bom *BOM, treeData []byte, outDir string) error {
+	th, err := ParseTree(treeData)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("  PathCount: %d, Child: block[%d]\n", th.PathCount, th.Child)
+
+	os.MkdirAll(outDir, 0755)
+
+	rendIdx := 0
+	nodeData := bom.Block(th.Child)
+	for nodeData != nil {
+		node, entries, err := ParseTreeNode(nodeData)
+		if err != nil {
+			return err
+		}
+		for _, entry := range entries {
+			csiData := bom.Block(entry.ValueIndex)
+			if csiData == nil {
+				continue
+			}
+			fmt.Printf("\n  Rendition[%d] (block[%d], %d bytes):\n", rendIdx, entry.ValueIndex, len(csiData))
+			err := processRendition(csiData, outDir, rendIdx)
+			if err != nil {
+				fmt.Printf("    Error: %v\n", err)
+			}
+			rendIdx++
+		}
+		if node.Forward == 0 {
+			break
+		}
+		nodeData = bom.Block(node.Forward)
+	}
+	return nil
+}
+
+func processRendition(csiData []byte, outDir string, idx int) error {
+	csi, err := ParseCSIHeader(csiData)
+	if err != nil {
+		return err
+	}
+
+	name := cString(csi.Name[:])
+	pfStr := PixelFormatStr(csi.PixelFormat)
+	layName := LayoutName(csi.Layout)
+
+	fmt.Printf("    Name: %s\n", name)
+	fmt.Printf("    Size: %dx%d, Scale: %d\n", csi.Width, csi.Height, csi.ScaleFactor)
+	fmt.Printf("    PixelFormat: %s (0x%08X)\n", pfStr, csi.PixelFormat)
+	fmt.Printf("    Layout: %s (%d)\n", layName, csi.Layout)
+	fmt.Printf("    BitmapCount: %d, TVLength: %d, RenditionLength: %d\n",
+		csi.BitmapCount, csi.TVLength, csi.RenditionLength)
+
+	// Parse TLV
+	tlvData := csiData[184 : 184+csi.TVLength]
+	tlvs := ParseTLV(tlvData, csi.TVLength)
+	for _, tlv := range tlvs {
+		fmt.Printf("    TLV type=%d len=%d\n", tlv.Type, tlv.Length)
+	}
+
+	// Bitmap data starts after CSI header (184) + TLV
+	bitmapStart := 184 + int(csi.TVLength)
+
+	// Parse bitmap offset table
+	if bitmapStart+4 > len(csiData) {
+		return fmt.Errorf("bitmap data extends beyond CSI")
+	}
+
+	bmpTag := string(csiData[bitmapStart : bitmapStart+4])
+	fmt.Printf("    Bitmap tag: %s\n", bmpTag)
+
+	if bmpTag == "MLEC" || bmpTag == "CELM" {
+		return extractMLECImage(csiData, bitmapStart, outDir, idx, name, csi)
+	}
+
+	// Try to find dmp2 magic directly
+	dm2Start := bytes.Index(csiData[bitmapStart:], []byte("dmp2"))
+	if dm2Start >= 0 {
+		dm2Start += bitmapStart
+		return extractDm2Image(csiData, dm2Start, outDir, idx, name)
+	}
+
+	fmt.Printf("    (no recognized image format)\n")
+	return nil
+}
+
+func extractMLECImage(csiData []byte, offset int, outDir string, idx int, name string, csi *CSIHeader) error {
+	// MLEC header: tag(4), version(4), field1(4), compressedSize(4), field2(4), field3(4), decompressedSize(4), padding(4)
+	if offset+32 > len(csiData) {
+		return fmt.Errorf("MLEC header too small")
+	}
+
+	// Find dmp2 magic after the MLEC header
+	dm2Start := bytes.Index(csiData[offset:], []byte("dmp2"))
+	if dm2Start < 0 {
+		return fmt.Errorf("no dmp2 magic found in MLEC block")
+	}
+	dm2Start += offset
+
+	return extractDm2Image(csiData, dm2Start, outDir, idx, name)
+}
+
+func extractDm2Image(csiData []byte, dm2Offset int, outDir string, idx int, name string) error {
+	header, err := ParseDm2Header(csiData[dm2Offset:])
+	if err != nil {
+		return err
+	}
+
+	fmt.Printf("    dmp2: type=%d ver=%d pred=%d pixfmt=%d %dx%d\n",
+		header.DecodeType, header.Version, header.PredictorType,
+		header.PixelFormat, header.Width, header.Height)
+
+	payload := csiData[dm2Offset+header.HeaderSize():]
+
+	lzfseBin := findLZFSEBinary()
+	if lzfseBin == "" {
+		return fmt.Errorf("lzfse binary not found; build _tools/lzfse first")
+	}
+
+	decompressor := func(data []byte, tryLZVN bool) ([]byte, error) {
+		return decompressLZFSE(lzfseBin, data)
+	}
+
+	// dmp2 payload may have size-prefixed LZFSE streams for banded images.
+	// Format: [u32_le stream_size][stream_data] repeated
+	// Parse the first stream to see if it decompresses correctly.
+	if len(payload) < 4 {
+		return fmt.Errorf("payload too small")
+	}
+
+	// Try size-prefixed stream format
+	firstStreamSize := binary.LittleEndian.Uint32(payload[0:4])
+	if firstStreamSize > 0 && firstStreamSize < uint32(len(payload)) && 4+int(firstStreamSize) <= len(payload) {
+		// Check if stream data starts with bvx2 magic
+		if string(payload[4:8]) == "bvx2" || string(payload[4:8]) == "bvxn" || string(payload[4:8]) == "bvx-" {
+			return extractBandedStreams(csiData, dm2Offset, payload, header, lzfseBin, outDir, idx, name)
+		}
+	}
+
+	// Single stream, try direct decompression
+	rgba, err := DecodeDm2(header, payload, decompressor)
+	if err != nil {
+		return fmt.Errorf("decode dmp2: %w", err)
+	}
+
+	outPath := filepath.Join(outDir, fmt.Sprintf("%03d_%s.png", idx, sanitizeFilename(name)))
+	return writePNG(outPath, int(header.Width), int(header.Height), rgba)
+}
+
+func extractBandedStreams(csiData []byte, dm2Offset int, payload []byte, firstHeader *Dm2Header, lzfseBin string, outDir string, idx int, name string) error {
+	type band struct {
+		header  *Dm2Header
+		payload []byte
+	}
+
+	decompressor := func(data []byte, tryLZVN bool) ([]byte, error) {
+		return decompressLZFSE(lzfseBin, data)
+	}
+
+	var bands []band
+	cursor := uint32(0)
+	bandIdx := 0
+
+	for cursor+4 <= uint32(len(payload)) {
+		streamSize := binary.LittleEndian.Uint32(payload[cursor : cursor+4])
+		if streamSize == 0 || cursor+4+streamSize > uint32(len(payload)) {
+			break
+		}
+		streamData := payload[cursor+4 : cursor+4+streamSize]
+		cursor += 4 + streamSize
+
+		// For the first band, use the dmp2 header we already parsed
+		// For subsequent bands, they may have their own dmp2 header embedded in the stream
+		if bandIdx == 0 {
+			bands = append(bands, band{header: firstHeader, payload: streamData})
+			fmt.Printf("    Band %d: %dx%d, %d compressed bytes\n", bandIdx, firstHeader.Width, firstHeader.Height, streamSize)
+		} else {
+			// Subsequent bands: the decompressed data is for the same image dimensions
+			// but with a different height (remaining rows)
+			// Create a modified header with adjusted height
+			h := *firstHeader
+			// The remaining height is total - sum of previous bands
+			totalDecoded := 0
+			for _, b := range bands {
+				totalDecoded += int(b.header.Height)
+			}
+			_ = totalDecoded
+			// But firstHeader.Height might be for the first band only
+			// We need to figure out the actual height from the decompressed size
+			bands = append(bands, band{header: &h, payload: streamData})
+			fmt.Printf("    Band %d: %d compressed bytes\n", bandIdx, streamSize)
+		}
+		bandIdx++
+	}
+
+	if len(bands) == 0 {
+		return fmt.Errorf("no bands found")
+	}
+
+	// Decode each band
+	width := int(bands[0].header.Width)
+	totalHeight := 0
+	var allRGBA []byte
+
+	for i, b := range bands {
+		// Decompress to figure out the actual band height
+		decompressed, err := decompressor(b.payload, false)
+		if err != nil {
+			return fmt.Errorf("decompress band %d: %w", i, err)
+		}
+
+		// For Default type, the decompressed data layout:
+		// [alpha_plane: w*h] [predictor: h] [high_stream: w*h*comp] [low_stream: w*h*comp]
+		// Total = w*h*(hasAlpha?1:0) + h + w*h*comp*2
+		// For RGBA (pixfmt=4): comp=3, hasAlpha=true
+		// Total = w*h + h + w*h*3*2 = w*h*7 + h
+		comp := b.header.SplitStreamComponents()
+		hasAlpha := b.header.HasAlpha()
+		alphaSize := 0
+		if hasAlpha {
+			alphaSize = 1
+		}
+		// bytes_per_pixel_decompressed = alphaSize + comp*2, plus predictor byte per row
+		// decompressed_size = w*h*(alphaSize + comp*2) + h
+		// Solve for h: h = decompressed_size / (w*(alphaSize + comp*2) + 1)
+		denom := width*(alphaSize+comp*2) + 1
+		bandHeight := len(decompressed) / denom
+		if bandHeight == 0 {
+			bandHeight = int(b.header.Height)
+		}
+		fmt.Printf("    Band %d: decompressed %d bytes, calculated height=%d\n", i, len(decompressed), bandHeight)
+
+		// Create a header with the correct band height
+		bandHeader := *b.header
+		bandHeader.Height = uint16(bandHeight)
+
+		rgba, err := decodeDefaultDecompressed(&bandHeader, decompressed, width, bandHeight)
+		if err != nil {
+			return fmt.Errorf("decode band %d: %w", i, err)
+		}
+		allRGBA = append(allRGBA, rgba...)
+		totalHeight += bandHeight
+	}
+
+	outPath := filepath.Join(outDir, fmt.Sprintf("%03d_%s.png", idx, sanitizeFilename(name)))
+	return writePNG(outPath, width, totalHeight, allRGBA)
+}
+
+func findLZFSEBinary() string {
+	candidates := []string{
+		"_tools/lzfse/lzfse.exe",
+		"_tools/lzfse/lzfse",
+		"_tools/lzfse/build/lzfse",
+		"_tools/lzfse/build/lzfse.exe",
+	}
+	for _, c := range candidates {
+		if _, err := os.Stat(c); err == nil {
+			return c
+		}
+	}
+	// Try PATH
+	if p, err := exec.LookPath("lzfse"); err == nil {
+		return p
+	}
+	return ""
+}
+
+func decompressLZFSE(lzfseBin string, data []byte) ([]byte, error) {
+	// Write to temp file
+	tmpIn, err := os.CreateTemp("", "lzfse_in_*.lzfse")
+	if err != nil {
+		return nil, err
+	}
+	defer os.Remove(tmpIn.Name())
+	tmpIn.Write(data)
+	tmpIn.Close()
+
+	tmpOut, err := os.CreateTemp("", "lzfse_out_*.raw")
+	if err != nil {
+		return nil, err
+	}
+	defer os.Remove(tmpOut.Name())
+	tmpOut.Close()
+
+	cmd := exec.Command(lzfseBin, "-decode", "-i", tmpIn.Name(), "-o", tmpOut.Name())
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return nil, fmt.Errorf("lzfse: %v: %s", err, stderr.String())
+	}
+
+	return os.ReadFile(tmpOut.Name())
+}
+
+func writePNG(path string, width, height int, rgba []byte) error {
+	img := image.NewRGBA(image.Rect(0, 0, width, height))
+	copy(img.Pix, rgba)
+
+	f, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	// Check if the image is actually grayscale for more efficient encoding
+	isGray := true
+	for i := 0; i < width*height; i++ {
+		r := rgba[i*4]
+		g := rgba[i*4+1]
+		b := rgba[i*4+2]
+		if r != g || g != b {
+			isGray = false
+			break
+		}
+	}
+
+	if isGray {
+		// Write as grayscale PNG
+		gray := image.NewGray(image.Rect(0, 0, width, height))
+		for i := 0; i < width*height; i++ {
+			gray.Pix[i] = rgba[i*4]
+		}
+		return png.Encode(f, gray)
+	}
+
+	return png.Encode(f, img)
+}
+
+func cString(data []byte) string {
+	if idx := bytes.IndexByte(data, 0); idx >= 0 {
+		return string(data[:idx])
+	}
+	return string(data)
+}
+
+func sanitizeFilename(s string) string {
+	s = strings.ReplaceAll(s, "/", "_")
+	s = strings.ReplaceAll(s, "\\", "_")
+	s = strings.ReplaceAll(s, ":", "_")
+	s = strings.ReplaceAll(s, "*", "_")
+	s = strings.ReplaceAll(s, "?", "_")
+	s = strings.ReplaceAll(s, "\"", "_")
+	s = strings.ReplaceAll(s, "<", "_")
+	s = strings.ReplaceAll(s, ">", "_")
+	s = strings.ReplaceAll(s, "|", "_")
+	if s == "" {
+		s = "unnamed"
+	}
+	return s
+}
+
+// Ensure io is used (for potential future use)
+var _ io.Reader
+// Ensure color is used
+var _ color.Color
