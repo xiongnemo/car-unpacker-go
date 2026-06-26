@@ -12,6 +12,9 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@v4
 
@@ -19,30 +22,17 @@ jobs:
         with:
           go-version: '1.21'
 
+      - name: Build lzfse
+        run: gcc -O2 -o lzfse src/lzfse_*.c src/lzvn_*.c -Isrc
+        working-directory: _tools/lzfse
+
       - name: Build
         run: go build -o car_unpacker .
 
-      - name: Build lzfse
-        run: |
-          if [ "$RUNNER_OS" == "Windows" ]; then
-            gcc -O2 -o lzfse.exe src/lzfse_*.c src/lzvn_*.c -Isrc
-          else
-            gcc -O2 -o lzfse src/lzfse_*.c src/lzvn_*.c -Isrc
-          fi
-        working-directory: _tools/lzfse
-
       - name: Run on test file
-        run: |
-          ./car_unpacker test_fixtures/timac_demo.car test_output
-        shell: bash
+        run: ./car_unpacker test_fixtures/timac_demo.car test_output
 
-      - name: Verify output directory exists
+      - name: Verify output
         run: |
-          if [ -d "test_output" ]; then
-            echo "Output directory created successfully"
-            ls -la test_output/
-          else
-            echo "Output directory not found"
-            exit 1
-          fi
-        shell: bash
+          ls -la test_output/
+          echo "Output directory created successfully"
