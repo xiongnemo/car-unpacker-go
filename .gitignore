@@ -2,3 +2,6 @@
 *.exe
 car_unpacker
 car_unpacker.exe
+__pycache__/
+*.pyc
+*.pyo
