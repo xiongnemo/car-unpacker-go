@@ -45,7 +45,7 @@ Cross-platform Go tool to list and extract assets from Apple `.car` (Asset Catal
 - Go 1.21+
 - `lzfse` binary in PATH or next to the executable
 
-Build lzfse from the vendored source:
+Build [lzfse](https://github.com/lzfse/lzfse) from the vendored source:
 
 ```bash
 cd _tools/lzfse
